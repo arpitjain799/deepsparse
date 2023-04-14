@@ -37,12 +37,17 @@ from scipy.special import softmax
 __all__ = ["TextGenerationPipeline"]
 
 
+# if we detect that model has external data make a shallow copy of the model and edit the inputs
+# else ... overwrite-transformer_onnx_model_inputs
+# symlink the data...
+
+
 def overwrite_transformer_onnx_model_inputs(
     path: str,
     batch_size: int = 1,
     max_length: int = 128,
     output_path: Optional[str] = None,
-    multitoken_path: Optional[str] = None,
+    is_single_token_model: bool = False,
 ) -> Tuple[Optional[str], List[str], Optional[NamedTemporaryFile]]:
     """
     Overrides an ONNX model's inputs to have the given batch size and sequence lengths.
@@ -60,13 +65,8 @@ def overwrite_transformer_onnx_model_inputs(
         otherwise, only the model input names will be returned
     """
 
-    editing_single_token_model = bool(multitoken_path)
-
     # overwrite input shapes
-    if multitoken_path:
-        model = onnx.load_model(multitoken_path, load_external_data=False)
-    else:
-        model = onnx.load(path)
+    model = onnx.load_model(path, load_external_data=not is_single_token_model)
 
     initializer_input_names = set([node.name for node in model.graph.initializer])
     external_inputs = [
@@ -77,17 +77,17 @@ def overwrite_transformer_onnx_model_inputs(
         if external_input.name == "input_ids":
             external_input.type.tensor_type.shape.dim[0].dim_value = batch_size
             external_input.type.tensor_type.shape.dim[1].dim_value = (
-                1 if editing_single_token_model else max_length
+                1 if is_single_token_model else max_length
             )
         elif external_input.name == "attention_mask":
             external_input.type.tensor_type.shape.dim[0].dim_value = batch_size
             external_input.type.tensor_type.shape.dim[1].dim_value = (
-                max_length - 1 if editing_single_token_model else 1
+                max_length - 1 if is_single_token_model else 1
             )
         elif external_input.name.startswith("past_key_values"):
             external_input.type.tensor_type.shape.dim[0].dim_value = batch_size
             external_input.type.tensor_type.shape.dim[1].dim_value = (
-                max_length - 1 if editing_single_token_model else 1
+                max_length - 1 if is_single_token_model else 1
             )
         else:
             raise ValueError(
@@ -95,7 +95,7 @@ def overwrite_transformer_onnx_model_inputs(
             )
         input_names.append(external_input.name)
 
-    save_as_external_data = all_tensors_to_one_file = not editing_single_token_model
+    save_as_external_data = all_tensors_to_one_file = not is_single_token_model
 
     # Save modified model
     if output_path is None:
@@ -166,8 +166,11 @@ class TextGenerationPipeline(TransformersPipeline):
         sampling_temperature: float = 1.0,
         num_tokens_to_generate: Optional[int] = None,
         delay_engine_initialize: bool = True,
+        save_temporary_models: Optional[str] = None,
         **kwargs,
     ):
+        # hack, to test whether models are saved correctly
+        self.save_temporary_models = save_temporary_models
         if delay_engine_initialize:
             # hack, because we cannot initialize the engine
             kwargs["_delay_engine_initialize"] = True
@@ -177,6 +180,9 @@ class TextGenerationPipeline(TransformersPipeline):
         self.sampling_temperature = sampling_temperature
         self.num_tokens_to_generate = num_tokens_to_generate
 
+        self.single_token_onnx_model = overwrite_transformer_onnx_model_inputs(
+            self.onnx_path, max_length=self.sequence_length, output_path=self.save_temporary_models, is_single_token_model = True
+        )
         self.single_token_engine = self._initialize_single_token_engine(
             delay_engine_initialize
         )
@@ -493,7 +499,7 @@ class TextGenerationPipeline(TransformersPipeline):
             self.onnx_input_names,
             self._temp_model_directory,
         ) = overwrite_transformer_onnx_model_inputs(
-            onnx_path, max_length=self.sequence_length
+            onnx_path, max_length=self.sequence_length, output_path=self.save_temporary_models
         )
 
         return onnx_path
